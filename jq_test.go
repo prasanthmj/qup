@@ -282,3 +282,50 @@ func TestRunningDelayedJobAfterRestart(t *testing.T) {
 
 	t.Logf("Task Executed after %v ", diff)
 }
+
+func TestRunningDuplicateRecurringJobs(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	te := test.NewTaskExecutor(t)
+
+	q := qup.NewJobQueue().Workers(10).TickPeriod(100 * time.Millisecond).DataFolder(testDataFolder).Logger(t)
+	q.Register(&test.TestTask{}, te)
+	err := q.Start()
+	if err != nil {
+		t.Errorf("Can't start jobqueue %v ", err)
+		return
+	}
+	repeats := 200 * time.Millisecond
+	taskID := faker.RandomString(8)
+	task := test.CreateTestTask(taskID).WithTaskTime(time.Duration(rand.Intn(30)) * time.Millisecond)
+	te.InitTask(task.TaskID)
+	job := qup.NewJob(task).Every(repeats)
+	err = q.QueueUp(job)
+	if err != nil {
+		t.Errorf("Error queuing up job %v", err)
+	}
+
+	<-time.After(2 * time.Second)
+
+	repeats2 := 300 * time.Millisecond
+	taskID2 := faker.RandomString(8)
+	task2 := test.CreateTestTask(taskID2).WithTaskTime(time.Duration(rand.Intn(30)) * time.Millisecond)
+	te.InitTask(task2.TaskID)
+	job2 := qup.NewJob(task2).Every(repeats2)
+	q.QueueUp(job2)
+
+	err = q.Stop()
+
+	if err != nil {
+		t.Errorf("Can't stop jobqueue %v ", err)
+		return
+	}
+	timesCalled := te.GetExecutionCount(taskID)
+	if timesCalled < 4 {
+		t.Errorf("Didn't run as many times as expected. ran %d times", timesCalled)
+	}
+
+	timesCalled2 := te.GetExecutionCount(taskID2)
+	if timesCalled2 > 0 {
+		t.Errorf("Duplicate recurring task ran %d times", timesCalled2)
+	}
+}

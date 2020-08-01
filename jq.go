@@ -16,7 +16,7 @@ type TaskExecutor interface {
 type JobQueue struct {
 	// sync variables - used for syncing - concurrency aware objects
 	jobs  chan string
-	close chan int
+	close chan struct{}
 	wg    sync.WaitGroup
 
 	//startup variables: that are used only while starting up
@@ -72,11 +72,10 @@ func (d *JobQueue) TickPeriod(tp time.Duration) *JobQueue {
 }
 
 func (d *JobQueue) Start() error {
-	d.access.Lock()
-	defer d.access.Unlock()
-	if d.started {
+	if d.isStarted() {
 		return errors.New("The queue was already started.")
 	}
+
 	if len(d.dataFolder) <= 0 {
 		return errors.New("Datafolder shouldn't be empty!")
 	}
@@ -88,7 +87,7 @@ func (d *JobQueue) Start() error {
 		d.NumWorkers = 10
 	}
 	d.jobs = make(chan string, d.NumWorkers)
-	d.close = make(chan int, d.NumWorkers)
+	d.close = make(chan struct{})
 	if d.tickPeriod <= 0 {
 		d.tickPeriod = 1 * time.Second
 	}
@@ -96,7 +95,7 @@ func (d *JobQueue) Start() error {
 	for i := 0; i < d.NumWorkers; i++ {
 		go d.worker(i + 1)
 	}
-	d.started = true
+	d.markStarted(true)
 	return nil
 }
 
@@ -185,29 +184,55 @@ func (d *JobQueue) periodicChecks() {
 			d.log.Errorf("Error inserting job to queue %v ", err)
 			continue
 		}
-
-		d.jobs <- jid
-
+		isClosed := d.signalNewJob(jid)
+		if isClosed {
+			//Close signal; will do the scheduled job processing later
+			//return home immediately
+			return
+		}
 	}
 }
+func (d *JobQueue) signalNewJob(jid string) bool {
+	//check whether already closed
+	select {
+	case <-d.close:
+		return false
+	default:
+	}
 
-func (d *JobQueue) Stop() error {
+	select {
+	case <-d.close:
+		return false
+	default:
+		d.jobs <- jid
+	}
+	return true
+}
+
+func (d *JobQueue) isStarted() bool {
 	d.access.Lock()
 	defer d.access.Unlock()
-	if !d.started {
-		return errors.New("The JobQueue is not started")
+	return d.started
+}
+func (d *JobQueue) markStarted(started bool) {
+	d.access.Lock()
+	defer d.access.Unlock()
+	d.started = started
+}
+func (d *JobQueue) Stop() error {
+	if !d.isStarted() {
+		return errors.New("The JobQueue is not started ")
 	}
 	if d.ticker != nil {
 		d.ticker.Stop()
 	}
 
-	for i := 0; i < d.NumWorkers; i++ {
-		d.close <- i
-	}
+	close(d.close)
 
 	d.wg.Wait()
 	d.store.Close()
-	d.started = false
+
+	d.markStarted(false)
 	return nil
 }
 func (d *JobQueue) isDuplicate(j *Job) bool {
@@ -265,7 +290,8 @@ func (d *JobQueue) QueueUp(j *Job) error {
 			return err
 		}
 		d.log.Logf("Job ID is  %v", jid)
-		d.jobs <- jid
+		d.signalNewJob(jid)
+		//d.jobs <- jid
 	}
 
 	return nil
