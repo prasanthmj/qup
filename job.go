@@ -2,6 +2,7 @@ package qup
 
 import (
 	"encoding/gob"
+	"reflect"
 	"time"
 )
 
@@ -61,4 +62,11 @@ func (j *Job) IsScheduled() bool {
 		return false
 	}
 	return true
+}
+
+func (j *Job) AreYouSame(other *Job) bool {
+	myname := reflect.TypeOf(j.Task).String()
+	othername := reflect.TypeOf(other.Task).String()
+
+	return (myname == othername)
 }

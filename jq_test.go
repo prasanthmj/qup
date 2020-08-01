@@ -221,3 +221,64 @@ func TestRunningRecurringJob(t *testing.T) {
 		lastCall = ts
 	}
 }
+
+func addDelayedTaskToQueue(t *testing.T, te *test.TestTaskExecutor, taskID string) {
+	q := qup.NewJobQueue().Workers(10).TickPeriod(200 * time.Millisecond).DataFolder(testDataFolder).Logger(t)
+	q.Register(&test.TestTask{}, te)
+	err := q.Start()
+	if err != nil {
+		t.Errorf("Can't start jobqueue %v ", err)
+		return
+	}
+	delay := 2 * time.Second
+
+	task := test.CreateTestTask(taskID).WithTaskTime(time.Duration(rand.Intn(100)) * time.Millisecond)
+	te.InitTask(task.TaskID)
+	job := qup.NewJob(task).After(delay)
+	q.QueueUp(job)
+	t.Logf("Added the Job. Waiting for some time...")
+	<-time.After(1 * time.Second)
+	t.Logf("Stopping the queue...")
+	err = q.Stop()
+	if err != nil {
+		t.Errorf("Can't stop jobqueue %v ", err)
+		return
+	}
+}
+func TestRunningDelayedJobAfterRestart(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	te := test.NewTaskExecutor(t)
+	taskID := faker.RandomString(8)
+	addDelayedTaskToQueue(t, te, taskID)
+	t.Logf("Created a queue and stopped it. Wait for some time ...")
+	<-time.After(1 * time.Second)
+	t.Logf("Starting the queue now")
+	//Created the task to run after 2 second and stopped the queue.
+	//Let us now start the queue again
+	q := qup.NewJobQueue().Workers(10).TickPeriod(200 * time.Millisecond).DataFolder(testDataFolder).Logger(t)
+	q.Register(&test.TestTask{}, te)
+	err := q.Start()
+	if err != nil {
+		t.Errorf("Can't start jobqueue %v ", err)
+		return
+	}
+	defer q.Stop()
+	t.Logf("Waiting for the queue ...")
+	<-time.After(2 * time.Second)
+
+	t.Logf("Checking for task execution status ...")
+	//te.PrintStatus()
+	if te.TaskCount() != 1 {
+		t.Error("The Delayed Task was not run task count ", te.TaskCount())
+	}
+	timesCalled := te.GetExecutionCount(taskID)
+	if timesCalled != 1 {
+		t.Errorf("The Delayed task was not executed as expected Times called %d ", timesCalled)
+	}
+	createdTime := te.GetTaskCreatedAt(taskID)
+	executedTime := te.GetTaskExecutedAt(taskID)
+
+	diff := executedTime.Sub(createdTime)
+
+	t.Logf("Task Executed after %v ", diff)
+}

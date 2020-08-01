@@ -117,13 +117,6 @@ func (d *JobQueue) worker(wid int) {
 	}
 }
 
-func (d *JobQueue) scheduleJob(job *Job) {
-	if job.IsRecurring() {
-		job.ScheduleNextDue()
-		d.store.Table("jobqueue.scheduled").Insert(job)
-	}
-}
-
 func (d *JobQueue) runTask(wid int, jid string) {
 	j, err := d.store.Table("jobqueue.ready").Cut(jid)
 	if err != nil {
@@ -137,7 +130,7 @@ func (d *JobQueue) runTask(wid int, jid string) {
 	}
 
 	//Schedules a job if it is recurring
-	defer d.scheduleJob(job)
+	defer d.scheduleRecurringJob(job)
 
 	name := reflect.TypeOf(job.Task).String()
 	d.access.RLock()
@@ -182,6 +175,7 @@ func (d *JobQueue) periodicChecks() {
 		}
 
 		job := j.(*Job)
+
 		// Why not execute the job immediately?
 		// When there are many scheduled jobs ready to go, that will
 		// make the execution sequential. This periodic check should
@@ -191,6 +185,7 @@ func (d *JobQueue) periodicChecks() {
 			d.log.Errorf("Error inserting job to queue %v ", err)
 			continue
 		}
+
 		d.jobs <- jid
 
 	}
@@ -215,11 +210,47 @@ func (d *JobQueue) Stop() error {
 	d.started = false
 	return nil
 }
+func (d *JobQueue) isDuplicate(j *Job) bool {
+	scheduledTable := d.store.Table("jobqueue.scheduled")
+	search, err := scheduledTable.Filter(
+		func(k string, j interface{}) bool {
+			job := j.(*Job)
+			if job.AreYouSame(job) {
+				return true
+			}
+			return false
+		})
+	if err != nil {
+		d.log.Errorf("Error while searching the job queue %v", err)
+		return false
+	}
+	if len(search) > 0 {
+		return true
+	}
+	return false
+}
+
+func (d *JobQueue) scheduleRecurringJob(job *Job) error {
+	if job.IsRecurring() {
+		//We won't allow Task of same type in recurring
+		// If a task od one type is already scheduled
+		// We won't allow another one
+		if d.isDuplicate(job) {
+			return nil
+		}
+		job.ScheduleNextDue()
+		_, err := d.store.Table("jobqueue.scheduled").Insert(job)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func (d *JobQueue) QueueUp(j *Job) error {
 
 	if j.IsRecurring() {
-		j.ScheduleNextDue()
+		return d.scheduleRecurringJob(j)
 	}
 
 	if j.IsScheduled() {
