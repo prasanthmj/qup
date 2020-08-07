@@ -23,9 +23,10 @@ type JobQueue struct {
 	recurringTickers []*time.Ticker
 
 	//startup variables: that are used only while starting up
-	NumWorkers int
-	dataFolder string
-	tickPeriod time.Duration
+	NumWorkers  int
+	dataFolder  string
+	tickPeriod  time.Duration
+	ignoreCalls bool
 
 	//variables used throughout
 	access                  *sync.RWMutex
@@ -53,6 +54,14 @@ func (d *JobQueue) Workers(n int) *JobQueue {
 	d.NumWorkers = n
 	return d
 }
+
+//IgnoreCalls Enable ignore calls in cases where you want to ignore
+// queuing up jobs (for example in case of unit testing)
+// This avoids having to start up  the job queue for unit testing other parts of your system
+func (d *JobQueue) IgnoreCalls(ignore bool) {
+	d.ignoreCalls = ignore
+}
+
 func (d *JobQueue) Logger(l Logger) *JobQueue {
 	if l == nil {
 		d.log = &emptyLogger{}
@@ -479,7 +488,12 @@ func (d *JobQueue) scheduleRecurringJob(job *Job) error {
 }
 
 func (d *JobQueue) QueueUp(j *Job) error {
-
+	if d.ignoreCalls {
+		return nil
+	}
+	if d.store == nil {
+		return fmt.Errorf("Queue is not started up")
+	}
 	if j.IsRecurring() {
 		return d.scheduleRecurringJob(j)
 	}
