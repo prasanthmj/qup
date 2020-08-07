@@ -20,9 +20,9 @@ func TestMain(m *testing.M) {
 
 type SimpleTask struct{}
 
-func (*SimpleTask) Run() error {
+func (*SimpleTask) GetTaskID() string {
 
-	return nil
+	return "simple-taskid"
 }
 
 func TestJobIsDue(t *testing.T) {
@@ -91,6 +91,25 @@ func TestRunningJob(t *testing.T) {
 
 	q.QueueUp(qup.NewJob(task))
 	<-time.After(3 * time.Second)
+
+	js, err := q.GetJobSnapshot()
+	if err != nil {
+		t.Errorf("Error getting job snapshot %v ", err)
+	} else {
+		if len(js.ReadyJobs) < 1 {
+			t.Errorf("No completed jobs in queue")
+		} else if !js.ReadyJobs[0].IsCompleted() {
+			t.Errorf("The job was not completed")
+		} else {
+			t.Logf("num jobs in ready queue %d ", len(js.ReadyJobs))
+			ready := js.ReadyJobs[0].CompletedAt.Sub(js.ReadyJobs[0].ReadyAt)
+			started := js.ReadyJobs[0].CompletedAt.Sub(js.ReadyJobs[0].StartedAt)
+			t.Logf("ready %v started %v ", ready, started)
+			t.Logf("Scheduled jobs %d ", len(js.ScheduledJobs))
+
+		}
+	}
+
 	err = q.Stop()
 	if err != nil {
 		t.Errorf("Can't stop jobqueue %v ", err)
@@ -283,49 +302,87 @@ func TestRunningDelayedJobAfterRestart(t *testing.T) {
 	t.Logf("Task Executed after %v ", diff)
 }
 
-func TestRunningDuplicateRecurringJobs(t *testing.T) {
+func TestOverflowRegularTasks(t *testing.T) {
+	const TasksCount = 1000
 	defer goleak.VerifyNone(t)
 	te := test.NewTaskExecutor(t)
-
-	q := qup.NewJobQueue().Workers(10).TickPeriod(100 * time.Millisecond).DataFolder(testDataFolder).Logger(t)
+	q := qup.NewJobQueue().Workers(10).TickPeriod(50 * time.Millisecond).DataFolder(testDataFolder).Logger(t)
 	q.Register(&test.TestTask{}, te)
 	err := q.Start()
 	if err != nil {
 		t.Errorf("Can't start jobqueue %v ", err)
 		return
 	}
-	repeats := 200 * time.Millisecond
-	taskID := faker.RandomString(8)
-	task := test.CreateTestTask(taskID).WithTaskTime(time.Duration(rand.Intn(30)) * time.Millisecond)
-	te.InitTask(task.TaskID)
-	job := qup.NewJob(task).Every(repeats)
-	err = q.QueueUp(job)
-	if err != nil {
-		t.Errorf("Error queuing up job %v", err)
+	for i := 0; i < TasksCount; i++ {
+		addTaskToQueue(t, q, te, 0)
 	}
-
-	<-time.After(2 * time.Second)
-
-	repeats2 := 300 * time.Millisecond
-	taskID2 := faker.RandomString(8)
-	task2 := test.CreateTestTask(taskID2).WithTaskTime(time.Duration(rand.Intn(30)) * time.Millisecond)
-	te.InitTask(task2.TaskID)
-	job2 := qup.NewJob(task2).Every(repeats2)
-	q.QueueUp(job2)
+	<-time.After(300 * time.Millisecond)
 
 	err = q.Stop()
-
 	if err != nil {
 		t.Errorf("Can't stop jobqueue %v ", err)
 		return
 	}
-	timesCalled := te.GetExecutionCount(taskID)
-	if timesCalled < 4 {
-		t.Errorf("Didn't run as many times as expected. ran %d times", timesCalled)
+	if !te.AssertAllTasksExecutedExactlyOnce() {
+		t.Errorf("Not all tasks executed as expected")
+	}
+	tec := te.GetTaskExecutionCount()
+	if tec != TasksCount {
+		t.Errorf("Task execution count expected %d actual %d", TasksCount, tec)
+	}
+	//te.PrintStatus()
+}
+
+func addTaskToQueue(t *testing.T, q *qup.JobQueue, te *test.TestTaskExecutor, repeats time.Duration) {
+	taskID := faker.RandomString(8)
+	task := test.CreateTestTask(taskID).WithTaskTime(time.Duration(rand.Intn(10)) * time.Millisecond)
+	te.InitTask(task.TaskID)
+	job := qup.NewJob(task)
+	if repeats > 0 {
+		job.Every(repeats)
+	}
+	err := q.QueueUp(job)
+	if err != nil {
+		t.Errorf("Error queuing up job %v", err)
+	}
+}
+
+func TestRunningRecurringAndOtherJobs(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	te := test.NewTaskExecutor(t)
+
+	q := qup.NewJobQueue().Workers(10).TickPeriod(50 * time.Millisecond).DataFolder(testDataFolder).Logger(t)
+	q.Register(&test.TestTask{}, te)
+	q.Register(&test.TestRecurringTask{}, te)
+
+	err := q.Start()
+	if err != nil {
+		t.Errorf("Can't start jobqueue %v ", err)
+		return
 	}
 
-	timesCalled2 := te.GetExecutionCount(taskID2)
-	if timesCalled2 > 0 {
-		t.Errorf("Duplicate recurring task ran %d times", timesCalled2)
+	for j := 0; j < 10; j++ {
+		repeats := 60 + time.Duration(rand.Intn(80))*time.Millisecond
+		addTaskToQueue(t, q, te, repeats)
 	}
+
+	for i := 0; i < 1000; i++ {
+		addTaskToQueue(t, q, te, 0)
+	}
+
+	<-time.After(5 * time.Second)
+
+	t.Log("--------------Stopping now ------------------------------")
+	err = q.Stop()
+	if err != nil {
+		t.Errorf("Can't stop jobqueue %v ", err)
+		return
+	}
+	if !te.AssertAllTasksExecutedAtleastOnce() {
+		t.Errorf("Not all tasks executed as expected")
+	}
+	tec := te.GetTaskExecutionCount()
+	t.Logf("Total Executions %d", tec)
+	te.PrintStatus()
+
 }

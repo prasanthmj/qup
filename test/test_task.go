@@ -15,6 +15,10 @@ func (task *TestTask) WithTaskTime(d time.Duration) *TestTask {
 	return task
 }
 
+func (task *TestTask) GetTaskID() string {
+	return task.TaskID
+}
+
 func (task *TestTask) RunTask(t *testing.T) error {
 
 	t.Logf("Test Task:%s Running run time %v ", task.TaskID, task.TaskTime)

@@ -3,6 +3,7 @@ package qup
 import (
 	"encoding/gob"
 	"errors"
+	"fmt"
 	"github.com/prasanthmj/sett"
 	"reflect"
 	"sync"
@@ -15,9 +16,11 @@ type TaskExecutor interface {
 
 type JobQueue struct {
 	// sync variables - used for syncing - concurrency aware objects
-	jobs  chan string
-	close chan struct{}
-	wg    sync.WaitGroup
+	jobs             chan string
+	close            chan struct{}
+	wg               sync.WaitGroup
+	ticker           *time.Ticker
+	recurringTickers []*time.Ticker
 
 	//startup variables: that are used only while starting up
 	NumWorkers int
@@ -25,13 +28,13 @@ type JobQueue struct {
 	tickPeriod time.Duration
 
 	//variables used throughout
-	access    *sync.RWMutex
-	store     *sett.Sett
-	ticker    *time.Ticker
-	started   bool
-	executors map[string]TaskExecutor
+	access                  *sync.RWMutex
+	started                 bool
+	executors               map[string]TaskExecutor
+	isPeriodicChecksRunning bool
 
-	log Logger
+	store *sett.Sett
+	log   Logger
 }
 
 func NewJobQueue() *JobQueue {
@@ -61,6 +64,9 @@ func (d *JobQueue) Logger(l Logger) *JobQueue {
 }
 
 func (d *JobQueue) Register(t interface{}, e TaskExecutor) {
+	d.access.Lock()
+	defer d.access.Unlock()
+
 	gob.Register(t)
 	name := reflect.TypeOf(t).String()
 	d.executors[name] = e
@@ -86,7 +92,8 @@ func (d *JobQueue) Start() error {
 	if d.NumWorkers <= 0 {
 		d.NumWorkers = 10
 	}
-	d.jobs = make(chan string, d.NumWorkers)
+	// One slot is for periodic checks
+	d.jobs = make(chan string, d.NumWorkers-1)
 	d.close = make(chan struct{})
 	if d.tickPeriod <= 0 {
 		d.tickPeriod = 1 * time.Second
@@ -116,20 +123,96 @@ func (d *JobQueue) worker(wid int) {
 	}
 }
 
-func (d *JobQueue) runTask(wid int, jid string) {
-	j, err := d.store.Table("jobqueue.ready").Cut(jid)
+/*
+readyTable.Update(jid, func(i) error{
+job started_at = now
+}, lock)
+
+
+readyTable.Update(jid, func(i) error{
+	job completed_at = now
+	}, lock)
+
+
+
+periodic checks__
+
+readyTable.Filter(func(i){
+	started 1 hour back
+	  reset
+	OR
+	not started
+	ch <- jid
+})
+
+*/
+func (d *JobQueue) markJobReady(jid string) error {
+	_, err := d.store.Table("jobqueue.ready").Update(jid, func(ij interface{}) error {
+		job, ok := ij.(*Job)
+		if !ok {
+			return fmt.Errorf("JobID %s Wrong type in Job Queue", jid)
+		}
+		job.MarkReady()
+		return nil
+	}, true)
 	if err != nil {
-		d.log.Errorf("Couldn't cut job item from sett id %s error %v ", jid, err)
-		return
+		return err
 	}
-	job, ok := j.(*Job)
-	if !ok {
-		d.log.Errorf("Received object from queue that does not convert to Job")
+
+	return nil
+}
+
+func (d *JobQueue) markJobDropped(jid string) error {
+	_, err := d.store.Table("jobqueue.ready").Update(jid, func(ij interface{}) error {
+		job := ij.(*Job)
+		job.MarkDropped()
+		return nil
+	}, true)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *JobQueue) markJobStarted(jid string) (*Job, error) {
+	j, err := d.store.Table("jobqueue.ready").Update(jid, func(ij interface{}) error {
+		job := ij.(*Job)
+		if job.HasStarted() {
+			return fmt.Errorf("Job already started")
+		}
+		job.MarkStarted()
+		return nil
+	}, true)
+	if err != nil {
+		return nil, err
+	}
+	job := j.(*Job)
+	return job, nil
+}
+
+func (d *JobQueue) markJobCompleted(jid string) error {
+	_, err := d.store.Table("jobqueue.ready").Update(jid, func(ij interface{}) error {
+		job := ij.(*Job)
+		job.MarkCompleted()
+		return nil
+	}, true)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (d *JobQueue) runTask(wid int, jid string) {
+	d.log.Logf("Worker %d startrunning job id %s\n", wid, jid)
+
+	job, err := d.markJobStarted(jid)
+	if err != nil {
+		d.log.Logf("job jid %s didn't start %v", jid, err)
 		return
 	}
 
-	//Schedules a job if it is recurring
-	defer d.scheduleRecurringJob(job)
+	defer d.markJobCompleted(jid)
 
 	name := reflect.TypeOf(job.Task).String()
 	d.access.RLock()
@@ -144,14 +227,11 @@ func (d *JobQueue) runTask(wid int, jid string) {
 		d.log.Errorf("Error while executing task executor %s error %v", name, err)
 		return
 	}
-
+	d.log.Logf("Worker %d completed %s \n", wid, jid)
 }
 
-func (d *JobQueue) periodicChecks() {
-	d.log.Logf("periodicChecks running ...")
-
+func (d *JobQueue) runScheduledJobs() {
 	scheduledTable := d.store.Table("jobqueue.scheduled")
-	readyTable := d.store.Table("jobqueue.ready")
 
 	jobsdue, err := scheduledTable.Filter(
 		func(k string, j interface{}) bool {
@@ -179,39 +259,121 @@ func (d *JobQueue) periodicChecks() {
 		// When there are many scheduled jobs ready to go, that will
 		// make the execution sequential. This periodic check should
 		// complete as soon as possible. So just push to ready queue and be done with that
-		jid, err := readyTable.Insert(job)
-		if err != nil {
-			d.log.Errorf("Error inserting job to queue %v ", err)
-			continue
+		d.addJobToReadyQueue(job)
+		if d.isClosing() {
+			return
 		}
-		isClosed := d.signalNewJob(jid)
-		if isClosed {
+	}
+}
+func (d *JobQueue) runDroppedJobs() {
+	d.log.Log("running dropped jobs ...")
+	readyTable := d.store.Table("jobqueue.ready")
+	dropped, err := readyTable.Filter(
+		func(k string, j interface{}) bool {
+			job := j.(*Job)
+			if job.IsDropped() {
+				return true
+			}
+			return false
+		})
+	if err != nil {
+		d.log.Errorf("Error while fetching dropped jobs %v", err)
+		return
+	}
+	for _, jid := range dropped {
+		d.log.Logf("signalling dropped job %s ", jid)
+		d.signalNewJob(jid)
+		if d.isClosing() {
+			d.log.Logf("runDroppedJobs: isClosing returning ...")
 			//Close signal; will do the scheduled job processing later
 			//return home immediately
 			return
 		}
 	}
 }
-func (d *JobQueue) signalNewJob(jid string) bool {
-	//check whether already closed
+func (d *JobQueue) isPeriodicTaskRunning() bool {
+	d.access.RLock()
+	defer d.access.RUnlock()
+	return d.isPeriodicChecksRunning
+}
+func (d *JobQueue) lockPeriodicChecks() bool {
+	if d.isPeriodicTaskRunning() {
+		return false
+	}
+	d.access.Lock()
+	defer d.access.Unlock()
+	if d.isPeriodicChecksRunning {
+		return false
+	}
+	d.isPeriodicChecksRunning = true
+	return true
+}
+func (d *JobQueue) unlockPeriodicChecks() {
+	d.access.Lock()
+	defer d.access.Unlock()
+	d.isPeriodicChecksRunning = false
+
+}
+
+func (d *JobQueue) periodicChecks() {
+	d.log.Logf("periodicChecks ...")
+	if !d.lockPeriodicChecks() {
+		d.log.Logf("periodicChecks failed getting lock. returning.")
+		return
+	}
+	defer d.unlockPeriodicChecks()
+	if d.isClosing() {
+		d.log.Logf("isClosing true returning(pt1) ...")
+		return
+	}
+	if len(d.jobs) >= (cap(d.jobs) - 1) {
+		d.log.Logf("periodicChecks- channels are tight. periodic checks postponing")
+		return
+	}
+	d.log.Logf("periodicChecks-  got lock! rock & roll!")
+	d.runScheduledJobs()
+	if d.isClosing() {
+		d.log.Logf("isClosing true returning(pt2) ...")
+		return
+	}
+	d.runDroppedJobs()
+	d.log.Logf("periodicChecks completed")
+}
+
+func (d *JobQueue) isClosing() bool {
 	select {
 	case <-d.close:
-		return false
+		return true
 	default:
 	}
-
+	return false
+}
+func (d *JobQueue) signalNewJob(jid string) bool {
+	d.log.Logf("signalNewJob %s ", jid)
+	//This is to keep track when the job signalled ready
+	// We will signal again if job is not picked even after some time
+	d.markJobReady(jid)
+	//check whether already shutting down and close channel is signalled
 	select {
 	case <-d.close:
 		return false
 	default:
-		d.jobs <- jid
+		d.log.Logf("signalling job %s ", jid)
+		select {
+		case d.jobs <- jid:
+		default:
+			//The queue is full. job got dropped
+			d.log.Logf("signal dropped %s ", jid)
+			d.markJobDropped(jid)
+		}
+
 	}
 	return true
 }
 
 func (d *JobQueue) isStarted() bool {
-	d.access.Lock()
-	defer d.access.Unlock()
+	d.access.RLock()
+	defer d.access.RUnlock()
 	return d.started
 }
 func (d *JobQueue) markStarted(started bool) {
@@ -226,48 +388,92 @@ func (d *JobQueue) Stop() error {
 	if d.ticker != nil {
 		d.ticker.Stop()
 	}
+	for _, ticker := range d.recurringTickers {
+		ticker.Stop()
+	}
 
 	close(d.close)
 
 	d.wg.Wait()
+	close(d.jobs)
 	d.store.Close()
 
 	d.markStarted(false)
 	return nil
 }
-func (d *JobQueue) isDuplicate(j *Job) bool {
-	scheduledTable := d.store.Table("jobqueue.scheduled")
-	search, err := scheduledTable.Filter(
-		func(k string, j interface{}) bool {
-			job := j.(*Job)
-			if job.AreYouSame(job) {
-				return true
-			}
-			return false
-		})
+
+type JobSnapshot struct {
+	ReadyJobs     []*Job
+	ScheduledJobs []*Job
+}
+
+func (d *JobQueue) GetJobSnapshot() (*JobSnapshot, error) {
+
+	rj, err := d.getAllJobs("jobqueue.ready")
 	if err != nil {
-		d.log.Errorf("Error while searching the job queue %v", err)
-		return false
+		return nil, err
 	}
-	if len(search) > 0 {
+	sj, err := d.getAllJobs("jobqueue.scheduled")
+	if err != nil {
+		return nil, err
+	}
+
+	return &JobSnapshot{rj, sj}, nil
+}
+
+func (d *JobQueue) getAllJobs(table string) ([]*Job, error) {
+	var ret []*Job
+	keys, err := d.store.Table(table).Filter(func(k string, v interface{}) bool {
 		return true
+	})
+	if err != nil {
+		return ret, err
 	}
-	return false
+	for _, k := range keys {
+		j, err := d.store.Table(table).GetStruct(k)
+		if err != nil {
+			d.log.Errorf("Error getting job item %v", err)
+		}
+		job := j.(*Job)
+		ret = append(ret, job)
+	}
+
+	return ret, nil
+}
+
+func (d *JobQueue) addJobToReadyQueue(job *Job) error {
+	jid, err := d.store.Table("jobqueue.ready").Insert(job)
+	if err != nil {
+		d.log.Logf("Error adding job to ready queue %v", err)
+		return err
+	}
+
+	d.log.Logf("Signalling taskID %s Job ID is  %v", job.Task.GetTaskID(), jid)
+	d.signalNewJob(jid)
+	return nil
+}
+
+func (d *JobQueue) runRecurring(job *Job) *time.Ticker {
+	ticker := time.NewTicker(job.Repeat)
+	go func() {
+		d.wg.Add(1)
+		defer d.wg.Done()
+		for {
+			select {
+			case <-ticker.C:
+				d.addJobToReadyQueue(job)
+			case <-d.close:
+				return
+			}
+		}
+	}()
+	return ticker
 }
 
 func (d *JobQueue) scheduleRecurringJob(job *Job) error {
 	if job.IsRecurring() {
-		//We won't allow Task of same type in recurring
-		// If a task od one type is already scheduled
-		// We won't allow another one
-		if d.isDuplicate(job) {
-			return nil
-		}
-		job.ScheduleNextDue()
-		_, err := d.store.Table("jobqueue.scheduled").Insert(job)
-		if err != nil {
-			return err
-		}
+		ticker := d.runRecurring(job)
+		d.recurringTickers = append(d.recurringTickers, ticker)
 	}
 	return nil
 }
@@ -284,14 +490,8 @@ func (d *JobQueue) QueueUp(j *Job) error {
 			return err
 		}
 	} else {
-		jid, err := d.store.Table("jobqueue.ready").Insert(j)
-		if err != nil {
-			d.log.Logf("Error returned in QueueUp %v", err)
-			return err
-		}
-		d.log.Logf("Job ID is  %v", jid)
-		d.signalNewJob(jid)
-		//d.jobs <- jid
+		d.log.Logf("inserting to queue ... ")
+		d.addJobToReadyQueue(j)
 	}
 
 	return nil
