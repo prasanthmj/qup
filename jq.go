@@ -487,6 +487,7 @@ func (d *JobQueue) scheduleRecurringJob(job *Job) error {
 	return nil
 }
 
+//upd
 func (d *JobQueue) QueueUp(j *Job) error {
 	if d.ignoreCalls {
 		return nil
