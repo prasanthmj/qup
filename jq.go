@@ -10,10 +10,15 @@ import (
 	"time"
 )
 
+//TaskExecutor is the service actually executes the task
+// TaskExecutor will be ready with all required "equipments" (for example Database connection pools, cache) for executing the task.
+// On the other hand, the job or task can't contain such objects because the job is persisted to disc and may be loaded later
+//
 type TaskExecutor interface {
 	Execute(interface{}) error
 }
 
+// JobQueue Represents the Queue of jobs The queue also manages the worker goroutines and the sync object
 type JobQueue struct {
 	// sync variables - used for syncing - concurrency aware objects
 	jobs             chan string
@@ -38,6 +43,10 @@ type JobQueue struct {
 	log   Logger
 }
 
+//NewJobQueue creates a new JobQueue
+// Example:
+// ```go
+// jq := NewJobQueue().DataFolder("./jobdata").Workers(10)
 func NewJobQueue() *JobQueue {
 
 	d := &JobQueue{NumWorkers: 10, log: &emptyLogger{}}
@@ -45,6 +54,7 @@ func NewJobQueue() *JobQueue {
 	d.access = &sync.RWMutex{}
 	return d
 }
+
 func (d *JobQueue) DataFolder(df string) *JobQueue {
 	d.dataFolder = df
 	return d
