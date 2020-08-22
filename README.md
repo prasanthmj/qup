@@ -65,3 +65,4 @@ qUp will check for duplicates; so even if you add the same job multiple times, o
 j := qup.NewJob(&SendNotification{})
 jq.QueueUp(j)
 ```
+

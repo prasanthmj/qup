@@ -47,6 +47,7 @@ type JobQueue struct {
 // Example:
 // ```go
 // jq := NewJobQueue().DataFolder("./jobdata").Workers(10)
+// ```
 func NewJobQueue() *JobQueue {
 
 	d := &JobQueue{NumWorkers: 10, log: &emptyLogger{}}
@@ -55,23 +56,38 @@ func NewJobQueue() *JobQueue {
 	return d
 }
 
+//DataFolder is the folder for BadgerDB data files
 func (d *JobQueue) DataFolder(df string) *JobQueue {
 	d.dataFolder = df
 	return d
 }
 
+//Workers number of worker go routines
 func (d *JobQueue) Workers(n int) *JobQueue {
 	d.NumWorkers = n
 	return d
 }
 
-//IgnoreCalls Enable ignore calls in cases where you want to ignore
+//IgnoreCalls - Enable ignore calls in cases where you want to ignore
 // queuing up jobs (for example in case of unit testing)
 // This avoids having to start up  the job queue for unit testing other parts of your system
 func (d *JobQueue) IgnoreCalls(ignore bool) {
 	d.ignoreCalls = ignore
 }
 
+//Logger - the interface to use as logger
+// Logger interface:
+//```go
+//type Logger interface {
+//	Log(args ...interface{})
+//
+//	Logf(format string, args ...interface{})
+//
+//	Error(args ...interface{})
+//
+//	Errorf(format string, args ...interface{})
+// }
+//```
 func (d *JobQueue) Logger(l Logger) *JobQueue {
 	if l == nil {
 		d.log = &emptyLogger{}
@@ -82,6 +98,13 @@ func (d *JobQueue) Logger(l Logger) *JobQueue {
 	return d
 }
 
+//Register register a TaskExecuter interface
+// The interface should implement an Execute() function that does the task
+//```go
+//type TaskExecutor interface {
+//	Execute(interface{}) error
+//}
+//```
 func (d *JobQueue) Register(t interface{}, e TaskExecutor) {
 	d.access.Lock()
 	defer d.access.Unlock()
