@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-//TaskExecutor is the service actually executes the task
+//TaskExecutor is the service that actually executes the task
 // TaskExecutor will be ready with all required "equipments" (for example Database connection pools, cache) for executing the task.
 // On the other hand, the job or task can't contain such objects because the job is persisted to disc and may be loaded later
 //
@@ -114,11 +114,16 @@ func (d *JobQueue) Register(t interface{}, e TaskExecutor) {
 	d.executors[name] = e
 }
 
+//TickPeriod set the interval to run periodicChecks
+// periodicChecks checks for scheduled jobs that and starts when due
+// also, it runs any jobs that were dropped when the queue was full
 func (d *JobQueue) TickPeriod(tp time.Duration) *JobQueue {
 	d.tickPeriod = tp
 	return d
 }
 
+//Start starts the job queue. It initiates the worker goroutines and keeps it
+// ready to accept tasks.
 func (d *JobQueue) Start() error {
 	if d.isStarted() {
 		return errors.New("The queue was already started.")
@@ -165,29 +170,6 @@ func (d *JobQueue) worker(wid int) {
 	}
 }
 
-/*
-readyTable.Update(jid, func(i) error{
-job started_at = now
-}, lock)
-
-
-readyTable.Update(jid, func(i) error{
-	job completed_at = now
-	}, lock)
-
-
-
-periodic checks__
-
-readyTable.Filter(func(i){
-	started 1 hour back
-	  reset
-	OR
-	not started
-	ch <- jid
-})
-
-*/
 func (d *JobQueue) markJobReady(jid string) error {
 	_, err := d.store.Table("jobqueue.ready").Update(jid, func(ij interface{}) error {
 		job, ok := ij.(*Job)
@@ -307,6 +289,7 @@ func (d *JobQueue) runScheduledJobs() {
 		}
 	}
 }
+
 func (d *JobQueue) runDroppedJobs() {
 	d.log.Log("running dropped jobs ...")
 	readyTable := d.store.Table("jobqueue.ready")
@@ -333,11 +316,13 @@ func (d *JobQueue) runDroppedJobs() {
 		}
 	}
 }
+
 func (d *JobQueue) isPeriodicTaskRunning() bool {
 	d.access.RLock()
 	defer d.access.RUnlock()
 	return d.isPeriodicChecksRunning
 }
+
 func (d *JobQueue) lockPeriodicChecks() bool {
 	if d.isPeriodicTaskRunning() {
 		return false
@@ -350,6 +335,7 @@ func (d *JobQueue) lockPeriodicChecks() bool {
 	d.isPeriodicChecksRunning = true
 	return true
 }
+
 func (d *JobQueue) unlockPeriodicChecks() {
 	d.access.Lock()
 	defer d.access.Unlock()
@@ -423,6 +409,9 @@ func (d *JobQueue) markStarted(started bool) {
 	defer d.access.Unlock()
 	d.started = started
 }
+
+//Stop signals and stops, the worker goroutines
+// stop waits till all goroutines are stopped
 func (d *JobQueue) Stop() error {
 	if !d.isStarted() {
 		return errors.New("The JobQueue is not started ")
@@ -520,7 +509,7 @@ func (d *JobQueue) scheduleRecurringJob(job *Job) error {
 	return nil
 }
 
-//upd
+//QueueUp Add a jobo to the queue.
 func (d *JobQueue) QueueUp(j *Job) error {
 	if d.ignoreCalls {
 		return nil
