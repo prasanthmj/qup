@@ -6,10 +6,14 @@ import (
 	"time"
 )
 
+//RunnableTask contains the data for the task (does not directly run the task)
+// GetTaskID() is uniquely identifying this task
 type RunnableTask interface {
 	GetTaskID() string
 }
 
+//Job is a wrapper around the task data and carries
+// The task progress information.
 type Job struct {
 	Task        RunnableTask
 	Due         time.Time
